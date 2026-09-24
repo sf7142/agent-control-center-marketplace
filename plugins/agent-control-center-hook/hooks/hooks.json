@@ -1,0 +1,127 @@
+{
+  "description": "agent-control-center-hook - 所有事件转发给 Agent Control Center 本地服务；PermissionRequest 等待裁决并以 hookSpecificOutput 回传 CodeBuddy。所有命令以 exit 0 收尾，任何异常都不影响 CodeBuddy。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/install-statusline.js\"; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" SessionEnd; exit 0",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" PreToolUse; exit 0",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" PostToolUse; exit 0",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" PostToolUseFailure; exit 0",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" PermissionRequest; exit 0",
+            "timeout": 135
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" TaskCompleted; exit 0",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" StopFailure; exit 0",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" Stop; exit 0",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" SubagentStart; exit 0",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 && node \"${CODEBUDDY_PLUGIN_ROOT}/scripts/acc-hook.js\" SubagentStop; exit 0",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

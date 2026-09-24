@@ -1,0 +1,29 @@
+{
+  "name": "agent-control-center",
+  "version": "0.1.2",
+  "description": "Agent Control Center 插件市场：Agent 弹窗提醒 + 权限决策 + 状态行",
+  "owner": {
+    "name": "Agent Control Center"
+  },
+  "plugins": [
+    {
+      "name": "agent-control-center-hook",
+      "source": "./plugins/agent-control-center-hook",
+      "description": "Agent 执行任务时弹系统级 GUI + 声音提醒；权限弹窗可直接「同意/同意并记住/拒绝」回传；拦截 AskUserQuestion 提供富交互问答窗；状态行展示模型与上下文使用率。",
+      "version": "0.1.2",
+      "author": {
+        "name": "Agent Control Center"
+      },
+      "license": "MIT",
+      "keywords": [
+        "hooks",
+        "permission",
+        "notification",
+        "statusline",
+        "codebuddy",
+        "windows"
+      ],
+      "category": "productivity"
+    }
+  ]
+}
