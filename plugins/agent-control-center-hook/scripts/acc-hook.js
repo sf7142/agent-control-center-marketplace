@@ -8,11 +8,13 @@
  * 从根本上避开「命令行传中文参数」与「静态 .ps1 无 BOM 被 GBK 错读」这两类编码坑。
  *
  * 事件处理：
- *   PermissionRequest              → 三键决策弹窗（拒绝 / 同意并记住 / 同意）
- *   PreToolUse(AskUserQuestion)    → 富交互问答弹窗（单选 / 多选 / 自定义输入），答案经 updatedInput 回传
+ *   PermissionRequest              → 三键决策弹窗；AskUserQuestion 走题目窗（decision.allow+updatedInput 跳过原生面板）
  *   Stop (stop_hook_active=false)  → 「任务完成」弹窗（含元信息栏 + 最后消息，不自动关）
  *   TaskCompleted                  → 「任务完成」弹窗（任务系统专用）
  *   StopFailure                    → 「任务失败」弹窗（红色，带错误摘要）
+ *   Notification(permission_prompt/AskUserQuestion) → 「题目展示」弹窗（transcript 反查题目+选项，
+ *                                                     回终端作答；反查失败回退「提问提醒」通用窗）
+ *   Notification(elicitation_dialog/agent_needs_input) → 「等待输入」弹窗（idle_prompt 空闲通知不弹，避免打扰）
  *   其它事件                       → 静默
  *
  * 硬性约定（CodeBuddy 安全契约）：
@@ -29,6 +31,7 @@ const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
 const http = require("node:http");
+const crypto = require("node:crypto");
 
 // ============================================
 // 配置和常量
@@ -43,11 +46,13 @@ const EVENT_PERMISSION_REQUEST = "PermissionRequest";
 const EVENT_STOP = "Stop";
 const EVENT_PRE_TOOL_USE = "PreToolUse";
 const EVENT_STOP_FAILURE = "StopFailure";
+const EVENT_NOTIFICATION = "Notification";
 const EVENT_TASK_COMPLETED = "TaskCompleted";
 const TOOL_ASK_USER_QUESTION = "AskUserQuestion";
 
 const SOUND_EXCLAMATION = "Exclamation";
 const SOUND_ASTERISK = "Asterisk";
+const SOUND_QUESTION = "Question";
 
 function loadConfig() {
   const defaults = { notify_url: "", sound_enabled: true, log_enabled: false };
@@ -123,6 +128,13 @@ function logError(message) {
   if (CONFIG.log_enabled) {
     try { fs.appendFileSync(ERROR_LOG, message); } catch { /* ignore */ }
   }
+}
+
+/** 记录每次收到的钩子事件（诊断用，log_enabled 开启时写 notify_error.log） */
+function logEvent(hookName, payload) {
+  if (!CONFIG.log_enabled) return;
+  const line = `${new Date().toISOString()} [EVENT] hook=${hookName} event=${payload.hook_event_name || "-"} tool=${payload.tool_name || "-"} notif=${payload.notification_type || "-"} session=${String(payload.session_id || "").slice(0, 8)} call=${payload.call_id || payload.tool_use_id || "-"}\n`;
+  try { fs.appendFileSync(ERROR_LOG, line); } catch { /* ignore */ }
 }
 
 function encodeUtf8ToBase64(str) {
@@ -370,7 +382,8 @@ function generateMetaInfoBar(sessionId, cwd, additionalFields = []) {
 
   const additionalRows = additionalFields.map((field) => {
     const label_b64 = encodeUtf8ToBase64(field.label);
-    const value = String(field.value).replace(/\\/g, "\\\\").replace(/'/g, "''");
+    // PS 单引号字符串不转义反斜杠，只 doubling 单引号（否则路径显示成 f:\\work）
+    const value = String(field.value).replace(/'/g, "''");
     return `
 $${field.id}Row = New-Object System.Windows.Controls.StackPanel
 $${field.id}Row.Orientation = 'Horizontal'
@@ -430,7 +443,7 @@ $pathLbl = New-Object System.Windows.Controls.TextBlock
 $pathLbl.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${pathLabel_b64}')) + ': '
 $pathLbl.FontSize = ${fontSizes.meta}; $pathLbl.FontWeight = 'Bold'; $pathLbl.Foreground = '${colors.labelText}'; $pathLbl.FontFamily = '${fontFamily.text}'
 $pathVal = New-Object System.Windows.Controls.TextBlock
-$pathVal.Text = '${cwd.replace(/\\/g, "\\\\").replace(/'/g, "''")}'
+$pathVal.Text = '${cwd.replace(/'/g, "''")}'
 $pathVal.FontSize = ${fontSizes.meta}; $pathVal.Foreground = '${colors.valueText}'; $pathVal.FontFamily = '${fontFamily.mono}'
 $pathVal.TextWrapping = 'Wrap'
 $pathRow.AddChild($pathLbl); $pathRow.AddChild($pathVal)
@@ -510,8 +523,9 @@ function handlePermissionRequest(data) {
   const toolName = extractField(data, "tool_name", "Unknown");
 
   if (toolName === TOOL_ASK_USER_QUESTION) {
-    // AskUserQuestion 不应走到这里（PreToolUse 已接管）；回退原生面板
-    return;
+    // 实测（0.1.7 日志）：AskUserQuestion 主流程不触发 PermissionRequest（走产品交互路径）。
+    // 保留此分支作 forward-compat：若未来版本触发，则弹题目窗并跳过原生面板。
+    return handlePermissionRequestForAsk(data);
   }
 
   playSound(SOUND_EXCLAMATION);
@@ -691,20 +705,176 @@ Write-Output $w.Tag
 }
 
 // ============================================
+// AskUserQuestion 防迟到 / 防重复（跨进程接力）
+// ============================================
+//
+// 时序 bug 背景：CodeBuddy 运行时会在多个路径触发 PreToolUse 钩子
+// （needsApproval 未命中缓存时，executeToolWithHooks 会补跑），且 CLI 原生
+// 问题面板可能先行收集答案。本插件的 WPF 弹窗启动慢（node→PowerShell→WPF 数秒），
+// 慢启动 + 重复触发会导致「用户已作答后弹窗才出现」「同一问题弹两次」。
+//
+// 对策：在系统临时目录写状态文件做跨进程去重与答案接力。键 = session + call_id
+// + questions 摘要（同一工具调用的多次触发同键；新调用新键，不会误复用）：
+//   state=pending       有实例正在弹窗（重复实例等待其结果，不重复弹）
+//   state=answered      问题已由本插件弹窗作答，后续触发直接复用答案输出
+//   state=fell_through  前一实例「知道了（回到 CLI）」，后续触发同样静默回退
+
+const ASK_STATE_DIR = path.join(os.tmpdir(), "acc-hook-ask");
+const ASK_STATE_TTL_MS = 10 * 60 * 1000; // 状态文件最长保留
+const ASK_WAIT_MS = 240 * 1000; // 等待在途实例作答的最长时间（< PreToolUse 钩子 300s 超时）
+
+function askStateKey(data, questions) {
+  const sessionId = String(extractField(data, "session_id", ""));
+  const callId = String(data.call_id || data.tool_use_id || data.callId || data.toolUseId || "");
+  const digest = crypto.createHash("sha1").update(JSON.stringify(questions)).digest("hex").slice(0, 12);
+  return `${(sessionId || "nosession").substring(0, 8)}-${callId || "nocall"}-${digest}`;
+}
+
+function askStatePath(key) {
+  return path.join(ASK_STATE_DIR, `ask-${key}.json`);
+}
+
+function readAskState(key) {
+  try {
+    return JSON.parse(fs.readFileSync(askStatePath(key), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeAskState(key, patch) {
+  try {
+    fs.mkdirSync(ASK_STATE_DIR, { recursive: true });
+    const prev = readAskState(key) || {};
+    fs.writeFileSync(askStatePath(key), `${JSON.stringify({ ...prev, ...patch })}\n`, "utf8");
+  } catch {
+    /* 状态文件失败不影响主流程 */
+  }
+}
+
+function removeAskState(key) {
+  try {
+    fs.unlinkSync(askStatePath(key));
+  } catch {
+    /* ignore */
+  }
+}
+
+function pidAlive(pid) {
+  const p = Number(pid);
+  if (!p) return false;
+  if (p === process.pid) return true;
+  try {
+    process.kill(p, 0);
+    return true;
+  } catch (err) {
+    return err && err.code === "EPERM";
+  }
+}
+
+function cleanupStaleAskStates() {
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(ASK_STATE_DIR)) {
+      const p = path.join(ASK_STATE_DIR, f);
+      try {
+        if (now - fs.statSync(p).mtimeMs > ASK_STATE_TTL_MS) fs.unlinkSync(p);
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** answers 是否已覆盖全部问题（运行时把 CLI 面板答案并入 tool_input 后，弹窗不再有意义） */
+function answersComplete(questions, answers) {
+  if (!answers || typeof answers !== "object") return false;
+  return questions.every((q) => {
+    const v = answers[q && q.question];
+    return Array.isArray(v) ? v.length > 0 : typeof v === "string" && v.length > 0;
+  });
+}
+
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* 无法阻塞时跳过等待，直接按当前状态处理 */
+  }
+}
+
+/**
+ * 处理同一工具调用的重复 PreToolUse 触发。
+ * 返回："fell_through"（跟随回退，静默退出）| 对象（复用答案）| null（无重复，继续弹窗）
+ */
+function resolveDuplicateAsk(key) {
+  let st = readAskState(key);
+  if (!st) return null;
+
+  if (st.state === "answered" || st.state === "fell_through") {
+    removeAskState(key);
+    return st.state === "answered" ? (st.answer && typeof st.answer === "object" ? st.answer : "fell_through") : "fell_through";
+  }
+
+  // state=pending：前一实例正在弹窗，等待其作答/回退/退出
+  const deadline = Date.now() + ASK_WAIT_MS;
+  while (Date.now() < deadline) {
+    sleepSync(500);
+    st = readAskState(key);
+    if (!st) return null; // 状态文件被清理 → 接管弹窗
+    if (st.state === "answered") {
+      removeAskState(key);
+      return st.answer && typeof st.answer === "object" ? st.answer : "fell_through";
+    }
+    if (st.state === "fell_through") {
+      removeAskState(key);
+      return "fell_through";
+    }
+    if (!pidAlive(st.pid)) {
+      // 前一实例进程已死且未留下结果 → 接管弹窗
+      removeAskState(key);
+      return null;
+    }
+  }
+  return null; // 等待超时（罕见）→ 接管弹窗
+}
+
+// ============================================
 // PreToolUse 处理（AskUserQuestion）
 // ============================================
 
-function handlePreToolUse(data) {
-  const toolName = extractField(data, "tool_name");
-  if (toolName !== TOOL_ASK_USER_QUESTION) return;
-
+function runAskDialog(data) {
   const S = getStyleHelpers();
   const toolInput = extractField(data, "tool_input", {});
   const questions = toolInput.questions || [];
   const cwd = extractField(data, "cwd", "");
   const sessionId = extractField(data, "session_id", "");
 
-  if (questions.length === 0) return;
+  if (questions.length === 0) return null;
+
+  // —— 防迟到 / 防重复 ——
+  const askKey = askStateKey(data, questions);
+  if (!PREVIEW_MODE) {
+    cleanupStaleAskStates();
+
+    // a) 答案已在 tool_input（上游已作答）→ 弹窗已无意义，静默回退
+    if (answersComplete(questions, toolInput.answers)) {
+      logError("acc-hook: ask skipped (answers already present in tool_input)\n");
+      return null;
+    }
+
+    // b) 同一工具调用的重复触发：复用既有答案 / 跟随前一实例回退，不重复弹窗
+    const dupAnswer = resolveDuplicateAsk(askKey);
+    if (dupAnswer === "fell_through") return null;
+    if (dupAnswer && typeof dupAnswer === "object") {
+      logError("acc-hook: ask answer reused from duplicate trigger\n");
+      return dupAnswer;
+    }
+
+    writeAskState(askKey, { state: "pending", pid: process.pid, ts: Date.now() });
+  }
 
   const q = questions[0];
   const options = q.options || [];
@@ -949,23 +1119,304 @@ Write-Output $w.Tag
         answers[q.question] = selectedOption;
       }
 
-      const output = {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "allow",
-          updatedInput: { ...toolInput, answers },
-        },
-      };
-      if (!PREVIEW_MODE) process.stdout.write(`${JSON.stringify(output)}\n`);
+      if (!PREVIEW_MODE) writeAskState(askKey, { state: "answered", answer: answers });
+      return answers;
     }
-    // 「知道了（回到 CLI）」：零输出，回退原生面板
+
+    // 「知道了（回到 CLI）」：回退原生面板；记录回退状态让重复触发同样静默
+    if (!PREVIEW_MODE) writeAskState(askKey, { state: "fell_through" });
+    return null;
   } catch (err) {
-    logError(`[PreToolUse] Error: ${(err && err.message) || "unknown"}\n`);
+    if (!PREVIEW_MODE) writeAskState(askKey, { state: "fell_through" });
+    logError(`[AskDialog] Error: ${(err && err.message) || "unknown"}\n`);
+    return null;
   }
 }
 
 // ============================================
-// 提醒弹窗（任务完成 / 任务失败 通用）
+// Notification 路径（AskUserQuestion 题目展示弹窗）
+// ============================================
+//
+// 架构约束（2.156/2.157 实测 + 逆向 2.157.0 bundle）：AskUserQuestion 走「产品交互路径」，
+// 原生 CLI 面板出现前唯一触发的钩子是 Notification(permission_prompt)（message 含工具名、
+// payload 无题目但带 transcript_path）；PermissionRequest / PreToolUse 均不触发，且 CLI 面板
+// 等待期间无法注入答案。因此桌面侧做「题目同步展示」：从 transcript 反查最后一条未作答的
+// AskUserQuestion，把题目+选项弹成系统窗口，用户回终端作答；答案注入仍由
+// PermissionRequest forward-compat 分支承担（未来版本若触发即完整接管）。
+//
+// 注意：HandleInterruptions 会先 await Notification 钩子再显示 CLI 面板，弹窗若一直开着会
+// 阻塞面板出现 → 加 120s 自动关闭（可用 ACC_ASK_AUTOCLOSE_S 环境变量覆盖，测试用）。
+
+const ASK_DISPLAY_AUTOCLOSE_S = Number(process.env.ACC_ASK_AUTOCLOSE_S) || 120;
+
+/**
+ * 从 transcript（JSONL）反查最后一条未作答的 AskUserQuestion。
+ * 待答 = type:function_call 且 name:AskUserQuestion，且其后没有同 callId 的 function_call_result。
+ * 返回 { questions, callId } 或 null。
+ */
+function extractPendingAskFromTranscript(transcriptPath) {
+  let text;
+  try {
+    text = fs.readFileSync(transcriptPath, "utf8");
+  } catch {
+    return null;
+  }
+  const lines = text.split("\n");
+  let call = null;
+  let callIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes("AskUserQuestion") || !line.includes("function_call")) continue;
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (o && o.type === "function_call" && o.name === TOOL_ASK_USER_QUESTION) {
+      call = o;
+      callIdx = i;
+      break;
+    }
+  }
+  if (!call) return null;
+  if (call.callId) {
+    for (let i = callIdx + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.includes(call.callId)) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      if (o && o.type === "function_call_result" && o.callId === call.callId) return null; // 已作答
+    }
+  }
+  let args = call.arguments;
+  if (typeof args === "string") {
+    try { args = JSON.parse(args); } catch { return null; }
+  }
+  const questions = args && Array.isArray(args.questions)
+    ? args.questions.filter((q) => q && typeof q === "object")
+    : [];
+  if (questions.length === 0) return null;
+  return { questions, callId: typeof call.callId === "string" ? call.callId : "" };
+}
+
+function displayAskStateKey(sessionId, seed) {
+  const digest = crypto.createHash("sha1").update(String(seed || "")).digest("hex").slice(0, 12);
+  return `${String(sessionId || "nosession").substring(0, 8)}-display-${digest}`;
+}
+
+function generateAskDisplayPs({ questions, sessionId, cwd }) {
+  const S = getStyleHelpers();
+  const title_b64 = encodeUtf8ToBase64("Agent Control Center · Agent 提问");
+  const heading_b64 = encodeUtf8ToBase64("Agent 正在向您提问");
+  const tip_b64 = encodeUtf8ToBase64(`请在终端的问题面板中作答；本窗口仅同步展示题目，${ASK_DISPLAY_AUTOCLOSE_S} 秒后自动关闭。`);
+  const knowBtn_b64 = encodeUtf8ToBase64("知道了（回终端作答）");
+
+  const additionalFields = [
+    { id: "qcount", label: "❓ 问题数", value: String(questions.length), wrap: false },
+  ];
+
+  const sections = questions.map((q, qi) => {
+    const header_b64 = encodeUtf8ToBase64(q.header || `问题 ${qi + 1}`);
+    const question_b64 = encodeUtf8ToBase64(q.question || "");
+    const multiTag_b64 = q.multiSelect === true ? encodeUtf8ToBase64("（可多选）") : "";
+
+    const optionCards = (Array.isArray(q.options) ? q.options : []).map((opt, oi) => {
+      const label_b64 = encodeUtf8ToBase64((opt && opt.label) || `选项 ${oi + 1}`);
+      const desc_b64 = encodeUtf8ToBase64((opt && opt.description) || "");
+      return `
+$optCard${qi}_${oi} = New-Object System.Windows.Controls.Border
+$optCard${qi}_${oi}.Background = '${S.colors.white}'
+$optCard${qi}_${oi}.BorderBrush = '${S.colors.border}'
+$optCard${qi}_${oi}.BorderThickness = '1'
+$optCard${qi}_${oi}.CornerRadius = '${S.cornerRadius.option}'
+$optCard${qi}_${oi}.Padding = '10,8'
+$optCard${qi}_${oi}.Margin = '0,0,0,6'
+$optInner${qi}_${oi} = New-Object System.Windows.Controls.StackPanel
+$optLabel${qi}_${oi} = New-Object System.Windows.Controls.TextBlock
+$optLabel${qi}_${oi}.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${label_b64}'))
+$optLabel${qi}_${oi}.FontWeight = 'Bold'; $optLabel${qi}_${oi}.FontSize = ${S.fontSizes.optionLabel}; $optLabel${qi}_${oi}.Foreground = '${S.colors.labelText}'; $optLabel${qi}_${oi}.FontFamily = '${S.fontFamily.text}'
+$optInner${qi}_${oi}.AddChild($optLabel${qi}_${oi})
+$optDesc${qi}_${oi} = New-Object System.Windows.Controls.TextBlock
+$optDesc${qi}_${oi}.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${desc_b64}'))
+$optDesc${qi}_${oi}.FontSize = ${S.fontSizes.optionDesc}; $optDesc${qi}_${oi}.Foreground = '${S.colors.descText}'; $optDesc${qi}_${oi}.TextWrapping = 'Wrap'; $optDesc${qi}_${oi}.Margin = '0,2,0,0'; $optDesc${qi}_${oi}.FontFamily = '${S.fontFamily.text}'
+$optInner${qi}_${oi}.AddChild($optDesc${qi}_${oi})
+$optCard${qi}_${oi}.Child = $optInner${qi}_${oi}
+$qPanel${qi}.AddChild($optCard${qi}_${oi})
+`;
+    }).join("\n");
+
+    const multiTagCode = multiTag_b64 ? `
+$multiTag${qi} = New-Object System.Windows.Controls.TextBlock
+$multiTag${qi}.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${multiTag_b64}'))
+$multiTag${qi}.FontSize = ${S.fontSizes.optionDesc}; $multiTag${qi}.Foreground = '${S.colors.primary}'; $multiTag${qi}.FontWeight = 'Bold'; $multiTag${qi}.FontFamily = '${S.fontFamily.text}'; $multiTag${qi}.Margin = '0,2,0,0'
+$qPanel${qi}.AddChild($multiTag${qi})
+` : "";
+
+    return `
+# —— 问题 ${qi + 1} ——
+$qPanel${qi} = New-Object System.Windows.Controls.StackPanel
+$qPanel${qi}.Margin = '0,0,0,16'
+
+$qHeader${qi} = New-Object System.Windows.Controls.TextBlock
+$qHeader${qi}.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${header_b64}'))
+$qHeader${qi}.FontSize = ${S.fontSizes.title}; $qHeader${qi}.FontWeight = 'Bold'; $qHeader${qi}.Foreground = '${S.colors.primary}'; $qHeader${qi}.FontFamily = '${S.fontFamily.text}'
+$qPanel${qi}.AddChild($qHeader${qi})
+${multiTagCode}
+$qText${qi} = New-Object System.Windows.Controls.TextBlock
+$qText${qi}.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${question_b64}'))
+$qText${qi}.FontSize = ${S.fontSizes.question}; $qText${qi}.FontWeight = 'Bold'; $qText${qi}.Foreground = '${S.colors.labelText}'; $qText${qi}.TextWrapping = 'Wrap'; $qText${qi}.FontFamily = '${S.fontFamily.text}'; $qText${qi}.Margin = '0,4,0,10'
+$qPanel${qi}.AddChild($qText${qi})
+${optionCards}
+$askPanel.AddChild($qPanel${qi})
+`;
+  }).join("\n");
+
+  const height = Math.min(760, Math.max(460, 320 + questions.length * 150));
+
+  return `
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+
+[System.Media.SystemSounds]::Question.Play()
+
+$w = New-Object System.Windows.Window
+$w.Title = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${title_b64}'))
+$w.Width = 700
+$w.Height = ${height}
+$w.WindowStartupLocation = 'CenterScreen'
+$w.ResizeMode = 'NoResize'
+$w.Background = '${S.colors.containerBackground}'
+
+$grid = New-Object System.Windows.Controls.Grid
+$grid.Margin = '0'
+
+$row0 = New-Object System.Windows.Controls.RowDefinition; $row0.Height = 'Auto'
+$row1 = New-Object System.Windows.Controls.RowDefinition; $row1.Height = 'Auto'
+$row2 = New-Object System.Windows.Controls.RowDefinition; $row2.Height = '*'
+$row3 = New-Object System.Windows.Controls.RowDefinition; $row3.Height = 'Auto'
+$row4 = New-Object System.Windows.Controls.RowDefinition; $row4.Height = 'Auto'
+$grid.RowDefinitions.Add($row0); $grid.RowDefinitions.Add($row1)
+$grid.RowDefinitions.Add($row2); $grid.RowDefinitions.Add($row3)
+$grid.RowDefinitions.Add($row4)
+
+$titlePanel = New-Object System.Windows.Controls.StackPanel
+$titlePanel.Margin = '20,18,20,12'
+[System.Windows.Controls.Grid]::SetRow($titlePanel, 0)
+
+$titleText = New-Object System.Windows.Controls.TextBlock
+$titleText.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${heading_b64}'))
+$titleText.FontSize = ${S.fontSizes.title}; $titleText.FontWeight = 'Bold'; $titleText.Foreground = '${S.colors.primary}'; $titleText.FontFamily = '${S.fontFamily.text}'
+$titlePanel.AddChild($titleText)
+$grid.AddChild($titlePanel)
+
+${generateMetaInfoBar(sessionId, cwd, additionalFields)}
+
+$scrollViewer = New-Object System.Windows.Controls.ScrollViewer
+$scrollViewer.VerticalScrollBarVisibility = 'Auto'
+$scrollViewer.HorizontalScrollBarVisibility = 'Disabled'
+$scrollViewer.Margin = '20,12,20,0'
+[System.Windows.Controls.Grid]::SetRow($scrollViewer, 2)
+
+$askPanel = New-Object System.Windows.Controls.StackPanel
+${sections}
+
+$scrollViewer.Content = $askPanel
+$grid.AddChild($scrollViewer)
+
+$tipBlock = New-Object System.Windows.Controls.TextBlock
+$tipBlock.Text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${tip_b64}'))
+$tipBlock.FontSize = ${S.fontSizes.optionDesc}; $tipBlock.Foreground = '${S.colors.descText}'; $tipBlock.TextWrapping = 'Wrap'; $tipBlock.FontFamily = '${S.fontFamily.text}'
+$tipBlock.Margin = '20,10,20,0'
+[System.Windows.Controls.Grid]::SetRow($tipBlock, 3)
+$grid.AddChild($tipBlock)
+
+$btnPanel = New-Object System.Windows.Controls.StackPanel
+$btnPanel.HorizontalAlignment = 'Center'
+$btnPanel.Margin = '16,12,16,16'
+[System.Windows.Controls.Grid]::SetRow($btnPanel, 4)
+
+$knowBtn = New-Object System.Windows.Controls.Button
+$knowBtn.Content = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${knowBtn_b64}'))
+$knowBtn.MinWidth = 180
+${S.buttonStyle('knowBtn', 'primary')}
+$knowBtn.Add_Click({ $w.Close() })
+$btnPanel.AddChild($knowBtn)
+$grid.AddChild($btnPanel)
+
+$w.Content = $grid
+
+$w.Add_Loaded({
+    $w.Topmost = $true
+    $w.Activate()
+    $knowBtn.Focus()
+    $w.Topmost = $false
+})
+
+$w.Add_KeyDown({
+    param($sender, $e)
+    if ($e.Key -eq 'Escape' -or $e.Key -eq 'Return') { $w.Close() }
+})
+
+$autoCloseTimer = New-Object System.Windows.Threading.DispatcherTimer
+$autoCloseTimer.Interval = [TimeSpan]::FromSeconds(${ASK_DISPLAY_AUTOCLOSE_S})
+$autoCloseTimer.Add_Tick({ $autoCloseTimer.Stop(); $w.Close() })
+$autoCloseTimer.Start()
+
+$w.ShowDialog() | Out-Null
+$autoCloseTimer.Stop()
+`;
+}
+
+/** 弹出题目展示窗（带跨进程去重：同一问题只弹一次） */
+function showAskDisplayPopup(data, extracted) {
+  const sessionId = extractField(data, "session_id", "");
+  const cwd = extractField(data, "cwd", "");
+  const askKey = displayAskStateKey(sessionId, extracted.callId || JSON.stringify(extracted.questions));
+
+  if (!PREVIEW_MODE) {
+    cleanupStaleAskStates();
+    const st = readAskState(askKey);
+    if (st) {
+      // 同一问题已展示过 / 有存活实例正在展示：不重复弹
+      if (st.state === "shown") return;
+      if (st.pid && st.pid !== process.pid && pidAlive(st.pid)) return;
+    }
+    writeAskState(askKey, { state: "pending", pid: process.pid, ts: Date.now() });
+  }
+
+  const ps = generateAskDisplayPs({ questions: extracted.questions, sessionId, cwd });
+  try {
+    executePowerShellScript(ps);
+    if (!PREVIEW_MODE) writeAskState(askKey, { state: "shown", pid: process.pid });
+  } catch (err) {
+    if (!PREVIEW_MODE) removeAskState(askKey);
+    logError(`[AskDisplay] Error: ${(err && err.message) || "unknown"}\n`);
+  }
+}
+
+/**
+ * PermissionRequest 路径的 AskUserQuestion 接管：
+ * PermissionRequest 钩子在 needsApproval 的 ask 分支触发，早于原生 CLI 面板，
+ * payload 带 tool_input（题目+选项）。返回 decision.allow + updatedInput 会被运行时消费——
+ * 跳过原生面板、答案直接注入工具输入（与 Claude Code 的 canUseTool 同款机制）。
+ */
+function handlePermissionRequestForAsk(data) {
+  const answers = runAskDialog(data);
+  if (!answers) return; // 知道了 / 异常 / 已有答案 → 零输出，退回原生面板
+  const toolInput = extractField(data, "tool_input", {});
+  const output = {
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      decision: { behavior: "allow", updatedInput: { ...toolInput, answers } },
+    },
+  };
+  if (!PREVIEW_MODE) process.stdout.write(`${JSON.stringify(output)}\n`);
+}
+
+// ============================================
+// 提醒弹窗（任务完成 / 任务失败 / 等待输入 通用）
 // ============================================
 
 /**
@@ -1128,7 +1579,7 @@ function handleStop(data) {
 
   showAlert({
     title: "Agent Control Center · 任务完成",
-    heading: "Agent 已完成",
+    heading: "Agent 已完成，等待输入",
     message: lastMessage ? redactText(lastMessage) : "",
     kind: "completed",
     sound: SOUND_ASTERISK,
@@ -1165,6 +1616,49 @@ function handleStopFailure(data) {
   });
 }
 
+function handleNotification(data) {
+  const type = data.notification_type || "";
+  if (type === "permission_prompt") {
+    const msg = String(data.message || "");
+    if (/AskUserQuestion/.test(msg)) {
+      // 实测（0.1.7/2.157.0）：AskUserQuestion 面板前唯一钩子是 Notification(permission_prompt)，
+      // payload 无题目但带 transcript_path → 反查未作答题目，弹题目展示窗。
+      const transcriptPath = extractField(data, "transcript_path", "");
+      const extracted = transcriptPath ? extractPendingAskFromTranscript(transcriptPath) : null;
+      if (extracted) {
+        showAskDisplayPopup(data, extracted);
+        return;
+      }
+      // transcript 反查失败（无文件/已作答/结构变化）→ 回退通用「提问提醒」窗（无题目）
+      showAlert({
+        title: "Agent Control Center · 提问提醒",
+        heading: "Agent 正在向您提问",
+        message: "问题已显示在终端，请前往回答。",
+        kind: "waiting",
+        sound: SOUND_QUESTION,
+        data,
+      });
+      return;
+    }
+    // ExitPlanMode 等其它权限类通知：仅响铃
+    playSound(SOUND_QUESTION);
+    return;
+  }
+  // 注意：不处理 idle_prompt —— 它是「会话空闲 60 秒」定时器触发的（运行时 setTimeout 6e4），
+  // 每轮对话结束后用户 60 秒没输入就弹一次，与 Stop 的「已完成，等待输入」弹窗重复且打扰。
+  // 只保留真正需要用户响应的场景：elicitation_dialog（MCP 诱导对话框）/ agent_needs_input。
+  if (type !== "agent_needs_input" && type !== "elicitation_dialog") return;
+
+  showAlert({
+    title: "Agent Control Center · 等待输入",
+    heading: "Agent 正在等待您的输入",
+    message: "",
+    kind: "waiting",
+    sound: SOUND_QUESTION,
+    data,
+  });
+}
+
 // ============================================
 // 预览模式
 // ============================================
@@ -1172,7 +1666,7 @@ function handleStopFailure(data) {
 function runPreview() {
   const baseData = { session_id: "a1b2c3d4-preview-test", cwd: process.cwd() };
 
-  console.log("[preview] 1/5 PermissionRequest 权限申请弹窗...");
+  console.log("[preview] 1/6 PermissionRequest 权限申请弹窗...");
   handlePermissionRequest({
     ...baseData,
     hook_event_name: EVENT_PERMISSION_REQUEST,
@@ -1181,8 +1675,8 @@ function runPreview() {
     permission_suggestions: [],
   });
 
-  console.log("[preview] 2/5 AskUserQuestion 单选弹窗...");
-  handlePreToolUse({
+  console.log("[preview] 2/6 AskUserQuestion 单选弹窗...");
+  runAskDialog({
     ...baseData,
     hook_event_name: EVENT_PRE_TOOL_USE,
     tool_name: TOOL_ASK_USER_QUESTION,
@@ -1200,8 +1694,8 @@ function runPreview() {
     },
   });
 
-  console.log("[preview] 3/5 AskUserQuestion 多选弹窗...");
-  handlePreToolUse({
+  console.log("[preview] 3/6 AskUserQuestion 多选弹窗...");
+  runAskDialog({
     ...baseData,
     hook_event_name: EVENT_PRE_TOOL_USE,
     tool_name: TOOL_ASK_USER_QUESTION,
@@ -1218,7 +1712,7 @@ function runPreview() {
     },
   });
 
-  console.log("[preview] 4/5 Stop 任务完成弹窗...");
+  console.log("[preview] 4/6 Stop 任务完成弹窗...");
   handleStop({
     ...baseData,
     hook_event_name: EVENT_STOP,
@@ -1227,12 +1721,30 @@ function runPreview() {
     background_tasks: [{ id: "t1" }, { id: "t2" }],
   });
 
-  console.log("[preview] 5/5 StopFailure 任务失败弹窗...");
+  console.log("[preview] 5/6 StopFailure 任务失败弹窗...");
   handleStopFailure({
     ...baseData,
     hook_event_name: EVENT_STOP_FAILURE,
     error: "预览模拟失败：command not found: not-a-real-cmd",
   });
+
+  console.log("[preview] 6/6 AskUserQuestion 题目展示弹窗（Notification 路径）...");
+  showAskDisplayPopup(
+    { ...baseData, hook_event_name: EVENT_NOTIFICATION, notification_type: "permission_prompt" },
+    {
+      callId: "preview-display",
+      questions: [{
+        header: "部署环境",
+        question: "这次要确认的部署/发包，目标环境是哪个？",
+        multiSelect: false,
+        options: [
+          { label: "DEV", description: "开发环境，默认 profile，自动 push 触发，不需要额外开关/建表动作" },
+          { label: "SIT", description: "集成测试环境，profile=sit；若开启 tran-api-access 需补配置+建表" },
+          { label: "REL", description: "生产环境，profile=rel，需审批+灰度" },
+        ],
+      }],
+    }
+  );
 
   console.log("[preview] 全部弹窗展示完毕");
 }
@@ -1261,13 +1773,15 @@ if (PREVIEW_MODE) {
     payload = {};
   }
   const event = hookName || payload.hook_event_name || "";
+  logEvent(event, payload);
 
   switch (event) {
     case EVENT_PERMISSION_REQUEST:
       handlePermissionRequest(payload);
       break;
     case EVENT_PRE_TOOL_USE:
-      handlePreToolUse(payload);
+      // PreToolUse 拦截已退役（AskUserQuestion 场景必然迟到，见 hooks.json / PermissionRequest 接管）
+      break;
       break;
     case EVENT_STOP:
       // 仅自然结束（非 stop hook 打断）才弹「任务完成」
@@ -1278,6 +1792,9 @@ if (PREVIEW_MODE) {
       break;
     case EVENT_STOP_FAILURE:
       handleStopFailure(payload);
+      break;
+    case EVENT_NOTIFICATION:
+      handleNotification(payload);
       break;
     default:
       break;
