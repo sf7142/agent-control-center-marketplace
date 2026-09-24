@@ -1,7 +1,7 @@
 {
   "name": "agent-control-center-hook",
-  "version": "0.1.2",
-  "description": "Agent 提醒插件：PermissionRequest / 等待输入 / 任务完成 / 任务失败时弹系统级 GUI + 声音提醒；权限弹窗可直接「同意 / 同意并记住 / 拒绝」并经 hookSpecificOutput 回传 CodeBuddy 原生权限机制。无需启动任何本地服务。",
+  "version": "0.1.9",
+  "description": "Agent 提醒插件：PermissionRequest / 等待输入 / 任务完成 / 任务失败时弹系统级 GUI + 声音提醒；权限弹窗可直接「同意 / 同意并记住 / 拒绝」并经 hookSpecificOutput 回传 CodeBuddy 原生权限机制。AskUserQuestion 提问时经 Notification 路径从 transcript 反查题目弹「题目展示」窗（防重复，回终端作答），PermissionRequest 触发时完整接管为富交互问答窗（防迟到/防重复）。无需启动任何本地服务。",
   "author": {
     "name": "Agent Control Center"
   },
