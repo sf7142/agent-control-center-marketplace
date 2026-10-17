@@ -10,7 +10,7 @@
  * 事件处理：
  *   PermissionRequest              → 三键决策弹窗；AskUserQuestion 走题目窗（decision.allow+updatedInput 跳过原生面板）
  *   Stop (stop_hook_active=false)  → 「任务完成」弹窗（含元信息栏 + 最后消息，不自动关）
- *   TaskCompleted                  → 「任务完成」弹窗（任务系统专用）
+ *   TaskCompleted                  → 静默（每个 todo 完成都触发，与 Stop 弹窗重复；完成信号统一由 Stop 承载）
  *   StopFailure                    → 「任务失败」弹窗（红色，带错误摘要）
  *   Notification(permission_prompt/AskUserQuestion) → 「题目展示」弹窗（transcript 反查题目+选项，
  *                                                     回终端作答；反查失败回退「提问提醒」通用窗）
@@ -47,7 +47,6 @@ const EVENT_STOP = "Stop";
 const EVENT_PRE_TOOL_USE = "PreToolUse";
 const EVENT_STOP_FAILURE = "StopFailure";
 const EVENT_NOTIFICATION = "Notification";
-const EVENT_TASK_COMPLETED = "TaskCompleted";
 const TOOL_ASK_USER_QUESTION = "AskUserQuestion";
 
 const SOUND_EXCLAMATION = "Exclamation";
@@ -1563,7 +1562,7 @@ function showAlert({ title, heading, message, kind, sound, data, additionalField
 }
 
 // ============================================
-// Stop / TaskCompleted / StopFailure / Notification 分发
+// Stop / StopFailure / Notification 分发
 // ============================================
 
 function handleStop(data) {
@@ -1585,21 +1584,6 @@ function handleStop(data) {
     sound: SOUND_ASTERISK,
     data,
     additionalFields,
-  });
-}
-
-function handleTaskCompleted(data) {
-  const cwd = extractField(data, "cwd", "");
-  const sessionId = extractField(data, "session_id", "");
-  const taskSubject = data.task_subject || "";
-
-  showAlert({
-    title: "Agent Control Center · 任务完成",
-    heading: taskSubject ? `任务已完成：${taskSubject}` : "任务已完成",
-    message: "",
-    kind: "completed",
-    sound: SOUND_ASTERISK,
-    data,
   });
 }
 
@@ -1787,8 +1771,9 @@ if (PREVIEW_MODE) {
       // 仅自然结束（非 stop hook 打断）才弹「任务完成」
       if (!payload.stop_hook_active) handleStop(payload);
       break;
-    case EVENT_TASK_COMPLETED:
-      handleTaskCompleted(payload);
+    case "TaskCompleted":
+      // 静默：TaskCompleted 只在任务/待办系统里某个 todo 被标 completed 时触发，
+      // 多步骤任务每一步都会触发，与 Stop 的「任务完成」弹窗重复。完成信号统一由 Stop 承载。
       break;
     case EVENT_STOP_FAILURE:
       handleStopFailure(payload);
